@@ -6,29 +6,7 @@ from PIL import Image
 import subprocess
 import os
 import select
-
-def generate_anchors(image_size=(320, 240)):
-    min_boxes = [[10, 16, 24], [32, 48], [64, 96], [128, 192, 256]]
-    steps = [8, 16, 32, 64]
-    anchors = []
-    for scale, fm_size in enumerate(zip([30, 15, 7, 4], [40, 20, 10, 5])):
-        fh, fw = fm_size
-        step = steps[scale]
-        min_box = min_boxes[scale]
-        for h in range(fh):
-            for w in range(fw):
-                center_x = (w + 0.5) * step
-                center_y = (h + 0.5) * step
-                for box_size in min_box:
-                    s_x = box_size / image_size[0]
-                    s_y = box_size / image_size[1]
-                    anchors.append([center_x / image_size[0], center_y / image_size[1], s_x, s_y])
-    return np.array(anchors, dtype=np.float32)
-
-def decode_boxes(boxes, anchors, center_variance=0.1, size_variance=0.2):
-    boxes_centers = boxes[:, :2] * center_variance * anchors[:, 2:] + anchors[:, :2]
-    boxes_sizes = np.exp(boxes[:, 2:] * size_variance) * anchors[:, 2:]
-    return np.hstack((boxes_centers - boxes_sizes / 2.0, boxes_centers + boxes_sizes / 2.0))
+from rfb640_utils import prepare_model_image, map_boxes_to_source
 
 def hard_nms(box_scores, iou_threshold=0.3, top_k=-1):
     scores = box_scores[:, -1]
@@ -61,9 +39,9 @@ def main():
     net = ncnn.Net()
     net.opt.use_vulkan_compute = False 
     net.opt.num_threads = 4  
-    net.load_param("models/RFB-320.param")
-    net.load_model("models/RFB-320.bin")
-    anchors = generate_anchors((320, 240))
+    model_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "models", "rfb640")
+    net.load_param(os.path.join(model_dir, "RFB-640.param"))
+    net.load_model(os.path.join(model_dir, "RFB-640.bin"))
 
     cmd = [
         "v4l2-ctl", "-d", "/dev/video0",
@@ -141,36 +119,35 @@ def main():
             img = Image.open(io.BytesIO(jpeg_data)).convert('RGB')
             t2 = time.time()
 
-            in_w, in_h = 320, 240
-            img_resized = img.resize((in_w, in_h))
+            model_pixels, scale_x, scale_y, pad_left, pad_top = prepare_model_image(img)
             in_pad = ncnn.Mat.from_pixels(
-                np.array(img_resized),
+                model_pixels,
                 ncnn.Mat.PixelType.PIXEL_RGB,
-                in_w, in_h
+                640, 480
             )
             in_pad.substract_mean_normalize([127.0]*3, [1/127.0]*3)
 
             ex = net.create_extractor()
-            ex.input("input", in_pad)
-            ret0, out0 = ex.extract("boxes")
-            ret1, out1 = ex.extract("scores")
+            ex.input("in0", in_pad)
+            ret0, out0 = ex.extract("out1")
+            ret1, out1 = ex.extract("out0")
             
             t3 = time.time()
 
             face_count = 0
             if ret0 == 0 and ret1 == 0:
-                raw_boxes = np.array(out0)
-                scores = np.array(out1)
-                
-                curr_anchors = anchors[:len(raw_boxes)] if len(anchors) >= len(raw_boxes) else np.vstack((anchors, np.tile(anchors[-1], (len(raw_boxes)-len(anchors), 1))))
+                normalized_boxes = np.asarray(out0).reshape(-1, 4)
+                scores = np.asarray(out1).reshape(-1, 2)
                 
                 face_scores = scores[:, 1]
                 mask = face_scores > 0.75
                 if np.any(mask):
-                    decoded = decode_boxes(raw_boxes[mask], curr_anchors[mask])
-                    box_scores = np.hstack((decoded, face_scores[mask][:, np.newaxis]))
+                    box_scores = np.hstack((normalized_boxes[mask], face_scores[mask][:, np.newaxis]))
                     filtered = hard_nms(box_scores, iou_threshold=0.3)
-                    face_count = len(filtered)
+                    _, valid_boxes = map_boxes_to_source(
+                        filtered[:, :4], img.size, scale_x, scale_y, pad_left, pad_top
+                    )
+                    face_count = int(np.count_nonzero(valid_boxes))
 
             # === 智能休眠逻辑判定 ===
             if face_count > 0:

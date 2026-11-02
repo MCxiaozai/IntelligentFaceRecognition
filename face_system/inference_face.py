@@ -1,36 +1,10 @@
 import subprocess
 import io
+import os
 import ncnn
 import numpy as np
 from PIL import Image
-
-def generate_anchors(image_size=(320, 240)):
-    min_boxes = [[10, 16, 24], [32, 48], [64, 96], [128, 192, 256]]
-    steps = [8, 16, 32, 64]
-    
-    anchors = []
-    for scale, fm_size in enumerate(zip([30, 15, 7, 4], [40, 20, 10, 5])):
-        fh, fw = fm_size
-        step = steps[scale]
-        min_box = min_boxes[scale]
-        for h in range(fh):
-            for w in range(fw):
-                center_x = (w + 0.5) * step
-                center_y = (h + 0.5) * step
-                for box_size in min_box:
-                    s_x = box_size / image_size[0]
-                    s_y = box_size / image_size[1]
-                    anchors.append([center_x / image_size[0], center_y / image_size[1], s_x, s_y])
-                    
-    return np.array(anchors, dtype=np.float32)
-
-def decode_boxes(boxes, anchors, center_variance=0.1, size_variance=0.2):
-    boxes_centers = boxes[:, :2] * center_variance * anchors[:, 2:] + anchors[:, :2]
-    boxes_sizes = np.exp(boxes[:, 2:] * size_variance) * anchors[:, 2:]
-    
-    boxes_x1y1 = boxes_centers - boxes_sizes / 2.0
-    boxes_x2y2 = boxes_centers + boxes_sizes / 2.0
-    return np.hstack((boxes_x1y1, boxes_x2y2))
+from rfb640_utils import prepare_model_image, map_boxes_to_source
 
 def hard_nms(box_scores, iou_threshold=0.3, top_k=-1):
     scores = box_scores[:, -1]
@@ -94,21 +68,19 @@ def run_face_detection():
         print("[-] 未能在输出流中找到有效的 JPEG 图像数据")
         return
 
-    img_matrix = np.array(img)
-
     # 初始化 NCNN 模型
     net = ncnn.Net()
     net.opt.use_vulkan_compute = False 
     net.opt.num_threads = 4  
-    net.load_param("models/RFB-320.param")
-    net.load_model("models/RFB-320.bin")
+    model_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "models", "rfb640")
+    net.load_param(os.path.join(model_dir, "RFB-640.param"))
+    net.load_model(os.path.join(model_dir, "RFB-640.bin"))
 
-    in_w, in_h = 320, 240
-    img_resized = Image.fromarray(img_matrix).resize((in_w, in_h))
+    model_pixels, scale_x, scale_y, pad_left, pad_top = prepare_model_image(img)
     in_pad = ncnn.Mat.from_pixels(
-        np.array(img_resized),
+        model_pixels,
         ncnn.Mat.PixelType.PIXEL_RGB,
-        in_w, in_h
+        640, 480
     )
 
     mean_vals = [127.0, 127.0, 127.0]
@@ -116,43 +88,36 @@ def run_face_detection():
     in_pad.substract_mean_normalize(mean_vals, norm_vals)
 
     ex = net.create_extractor()
-    ex.input("input", in_pad)
+    ex.input("in0", in_pad)
     
-    ret0, out0 = ex.extract("boxes")
-    ret1, out1 = ex.extract("scores")
+    ret0, out0 = ex.extract("out1")
+    ret1, out1 = ex.extract("out0")
     
     if ret0 == 0 and ret1 == 0:
-        raw_boxes = np.array(out0)   
-        scores = np.array(out1)      
-        
-        anchors = generate_anchors((in_w, in_h))
-        if len(anchors) > len(raw_boxes):
-            anchors = anchors[:len(raw_boxes)]
-        elif len(anchors) < len(raw_boxes):
-            padding = np.tile(anchors[-1], (len(raw_boxes) - len(anchors), 1))
-            anchors = np.vstack((anchors, padding))
+        normalized_boxes = np.asarray(out0).reshape(-1, 4)
+        scores = np.asarray(out1).reshape(-1, 2)
         
         face_scores = scores[:, 1]
         conf_thresh = 0.7
         mask = face_scores > conf_thresh
         
-        valid_raw_boxes = raw_boxes[mask]
+        valid_boxes = normalized_boxes[mask]
         valid_scores = face_scores[mask]
-        valid_anchors = anchors[mask]
         
         if len(valid_scores) > 0:
-            decoded_boxes = decode_boxes(valid_raw_boxes, valid_anchors)
-            box_scores = np.hstack((decoded_boxes, valid_scores[:, np.newaxis]))
+            box_scores = np.hstack((valid_boxes, valid_scores[:, np.newaxis]))
             filtered_boxes = hard_nms(box_scores, iou_threshold=0.3)
+            source_boxes, valid_indices = map_boxes_to_source(
+                filtered_boxes[:, :4], img.size, scale_x, scale_y, pad_left, pad_top
+            )
+            filtered_boxes = filtered_boxes[valid_indices]
             
             print(f"[+] 成功检测到 {len(filtered_boxes)} 张精准人脸！")
             
             for idx, fb in enumerate(filtered_boxes):
-                x1, y1, x2, y2, score = fb
-                x1 = int(x1 * w_img)
-                y1 = int(y1 * h_img)
-                x2 = int(x2 * w_img)
-                y2 = int(y2 * h_img)
+                x1, y1, x2, y2 = source_boxes[idx]
+                score = fb[4]
+                x1, y1, x2, y2 = map(int, (x1, y1, x2, y2))
                 print(f"    - 人脸 #{idx+1}: 像素坐标=({x1}, {y1}, {x2}, {y2}), 置信度={score:.4f}")
         else:
             print("[*] 未检测到置信度达标的人脸。")
