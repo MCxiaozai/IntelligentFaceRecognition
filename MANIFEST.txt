@@ -1,0 +1,10 @@
+# Pi 文件基线快照 —— 由 scripts/pi_pull.sh 生成，勿手改
+# 采集时间: 2026-10-25 12:04:28
+# 源主机:   pi4@pi4.local
+# 格式:     MD5  字节数  远端修改时间  相对路径
+e21c3a5ac90ed4afeff2fd909824bc66       5539  2026-10-25 11:29:35  face_system/inference_face.py
+90fdf482bf1319f130f237af610c85a2    1095760  2026-10-25 10:42:21  face_system/models/RFB-320.bin
+4ab0a2967bfaa06f3f6f9294c0b8f9c2      10237  2026-10-25 10:41:47  face_system/models/RFB-320.param
+bb0d5806d5d7db2ec5bdde46a3f97dda       5589  2026-10-25 12:02:26  face_system/stream_face.py
+be8ef761365b9c6f2085f0fa68845706        946  2026-10-08 10:24:17  test_camera.py
+e418b03eb862e1b7b9c436f5df668c97      25965  2026-10-08 10:24:31  test_frame.jpg
