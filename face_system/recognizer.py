@@ -6,39 +6,43 @@ recognizer.py —— 基于 NCNN MobileFaceNet(ArcFace) 的人脸特征提取（
 对应开题报告「研究内容③（特征提取）」与「技术路线(3)」：提取特征向量。
   - 模型：models/facenet/mobilefacenet.param/.bin（InsightFace mobileFaceNet，128 维）
   - 输入：112x112 RGB
-  - 前处理：mean=[127.5,127.5,127.5], norm=[1/128,1/128,1/128]  （(x-127.5)/128）
+  - 前处理：模型图内部执行 (x-127.5)/128，代码不再重复归一化
   - 输出：'fc1' 层 128 维，推理后做 L2 归一化
   - 预处理仅用 Pillow + NumPy，替代 cv2 流水线（符合去 OpenCV 要求）
 
-说明：该模型在“对齐后”的人脸上训练，若不做 5 点对齐，精度会略降；
-      align=True 的扩展位已预留（需关键点，可后续接 MTCNN/RetinaFace）。
-      若实测识别率异常偏低，把 PIXEL_TYPE 改为 PIXEL_BGR 再试（部分 ncnn 移植用 BGR）。
+说明：该模型用于对齐后的人脸；当前由 align.py 使用 RetinaFace 五点关键点完成对齐。
+      若实测识别率异常偏低，可检查模型要求的像素通道顺序（部分 NCNN 移植使用 BGR）。
 """
 import os
 import numpy as np
 from PIL import Image
 import ncnn
 
+HERE = os.path.dirname(os.path.abspath(__file__))
+
 
 class Recognizer:
     INPUT_SIZE = 112
-    MEAN = [127.5, 127.5, 127.5]
-    NORM = [1.0 / 128.0, 1.0 / 128.0, 1.0 / 128.0]
     INPUT_BLOB = "data"
     OUTPUT_BLOB = "fc1"
-    PIXEL_TYPE = ncnn.Mat.PixelType.PIXEL_RGB   # 如精度异常偏低可改 PIXEL_BGR
+    PIXEL_TYPE = ncnn.Mat.PixelType.PIXEL_RGB   # NCNN 像素通道格式
 
     # 注意：本机 ncnn 1.0 在 num_threads>1 时对该模型存在线程竞态 -> 不稳定段错误，
     # 故识别默认单线程（MobileFaceNet 极小，单线程足够快且稳定）。
-    def __init__(self, model_dir="models/facenet", num_threads=1):
-        self.model_dir = model_dir
+    def __init__(self, model_dir=None, num_threads=1):
+        # 默认从当前脚本所在目录定位模型，避免启动目录影响模型加载。
+        self.model_dir = model_dir or os.path.join(HERE, "models", "facenet")
         self.net = ncnn.Net()
         self.net.opt.use_vulkan_compute = False
         self.net.opt.num_threads = num_threads
-        param = os.path.join(model_dir, "mobilefacenet.param")
-        binf = os.path.join(model_dir, "mobilefacenet.bin")
-        self.net.load_param(param)
-        self.net.load_model(binf)
+        param = os.path.join(self.model_dir, "mobilefacenet.param")
+        binf = os.path.join(self.model_dir, "mobilefacenet.bin")
+        ret = self.net.load_param(param)
+        if ret != 0:
+            raise RuntimeError("MobileFaceNet 参数加载失败: %s (code=%d)" % (param, ret))
+        ret = self.net.load_model(binf)
+        if ret != 0:
+            raise RuntimeError("MobileFaceNet 权重加载失败: %s (code=%d)" % (binf, ret))
 
     def _preprocess(self, face_img):
         """face_img: PIL.Image(RGB)，任意尺寸 → 112x112 RGB numpy(uint8)"""
@@ -51,7 +55,7 @@ class Recognizer:
         arr = self._preprocess(face_img)
         mat = ncnn.Mat.from_pixels(arr, self.PIXEL_TYPE,
                                    self.INPUT_SIZE, self.INPUT_SIZE)
-        mat.substract_mean_normalize(self.MEAN, self.NORM)
+        # 模型图开头已执行 (像素值 - 127.5) / 128，此处不能重复归一化。
         ex = self.net.create_extractor()
         ex.input(self.INPUT_BLOB, mat)          # 必须先把图像张量绑到输入层，否则 extract 无数据会崩
         ret, out = ex.extract(self.OUTPUT_BLOB)

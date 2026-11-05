@@ -60,8 +60,12 @@ class _RetinaDetector:
         self.net = ncnn.Net()
         self.net.opt.use_vulkan_compute = False
         self.net.opt.num_threads = 2
-        self.net.load_param(RETINA_PARAM)
-        self.net.load_model(RETINA_BIN)
+        ret = self.net.load_param(RETINA_PARAM)
+        if ret != 0:
+            raise RuntimeError("RetinaFace 参数加载失败: %s (code=%d)" % (RETINA_PARAM, ret))
+        ret = self.net.load_model(RETINA_BIN)
+        if ret != 0:
+            raise RuntimeError("RetinaFace 权重加载失败: %s (code=%d)" % (RETINA_BIN, ret))
 
     @classmethod
     def instance(cls):
@@ -88,6 +92,8 @@ def detect_faces_from_image(img):
     r0, out0 = ex.extract("output0")
     r1, out1 = ex.extract("530")
     r2, out2 = ex.extract("529")
+    if r0 != 0 or r1 != 0 or r2 != 0:
+        raise RuntimeError("RetinaFace 输出提取失败: %d, %d, %d" % (r0, r1, r2))
 
     bbox = np.array(out0, dtype=np.float64).reshape(-1, 4)
     score = np.array(out1, dtype=np.float64).reshape(-1, 2)

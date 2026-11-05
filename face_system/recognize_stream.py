@@ -18,6 +18,8 @@ import os
 import sys
 import io
 import time
+import select
+import subprocess
 import numpy as np
 from PIL import Image, ImageDraw, ImageFont
 
@@ -31,6 +33,88 @@ import face_db
 DB_PATH = os.path.join(HERE, "face_db.npz")
 OUT_PATH = os.path.join(HERE, "recognize_out.jpg")
 RECOGNIZE_THRESH = 0.4     # 识别阈值：调高降低误识，调低提升召回
+
+
+class CameraStream:
+    """持续读取摄像头输出，避免每帧重新启动采集进程。"""
+
+    def __init__(self, device="/dev/video0", width=640, height=360):
+        self.device = device
+        self.width = width
+        self.height = height
+        self.buffer = bytearray()
+        self.process = None
+        self._start()
+
+    def _start(self):
+        """启动持续输出 JPEG 帧的摄像头进程。"""
+        command = [
+            "v4l2-ctl", "-d", self.device,
+            "--set-fmt-video=width=%d,height=%d,pixelformat=MJPG" %
+            (self.width, self.height),
+            "--stream-mmap", "--stream-count=0", "--stream-to=-",
+        ]
+        self.process = subprocess.Popen(
+            command, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+            bufsize=0)
+
+    def _restart(self):
+        """关闭异常采集进程并重新启动。"""
+        if self.process is not None and self.process.poll() is None:
+            self.process.terminate()
+            try:
+                self.process.wait(timeout=1.0)
+            except subprocess.TimeoutExpired:
+                self.process.kill()
+                self.process.wait()
+        self.buffer.clear()
+        self._start()
+
+    def read_frame(self):
+        """从字节流中取出一帧完整 JPEG；采集超时或中断时自动重启。"""
+        while True:
+            if self.process.poll() is not None:
+                self._restart()
+                continue
+
+            ready, _, _ = select.select([self.process.stdout], [], [], 2.0)
+            if not ready:
+                self._restart()
+                continue
+
+            chunk = self.process.stdout.read(4096)
+            if not chunk:
+                self._restart()
+                continue
+            self.buffer.extend(chunk)
+
+            if len(self.buffer) > 2 * 1024 * 1024:
+                self.buffer.clear()
+                continue
+
+            start = self.buffer.find(b"\xff\xd8")
+            if start < 0:
+                if len(self.buffer) > 1:
+                    del self.buffer[:-1]
+                continue
+            if start > 0:
+                del self.buffer[:start]
+
+            end = self.buffer.find(b"\xff\xd9", 2)
+            if end >= 0:
+                frame = bytes(self.buffer[:end + 2])
+                del self.buffer[:end + 2]
+                return frame
+
+    def close(self):
+        """结束持续采集进程。"""
+        if self.process is not None and self.process.poll() is None:
+            self.process.terminate()
+            try:
+                self.process.wait(timeout=1.0)
+            except subprocess.TimeoutExpired:
+                self.process.kill()
+                self.process.wait()
 
 
 def _draw_box(draw, box, label):
@@ -55,15 +139,12 @@ def main(duration=0.0):
 
     start = time.time()
     frame = 0
+    camera = CameraStream()
     try:
         while True:
             if duration > 0 and (time.time() - start) > duration:
                 break
-            try:
-                data = align.grab_jpeg()
-            except RuntimeError as e:
-                print("相机错误: %s" % e)
-                break
+            data = camera.read_frame()
 
             dets = align.detect_faces_from_jpeg(data)
             img = Image.open(io.BytesIO(data)).convert("RGB")
@@ -84,6 +165,8 @@ def main(duration=0.0):
             time.sleep(0.05)    # 轻微节流，降低 CPU 占用
     except KeyboardInterrupt:
         print("\n用户中断，退出。")
+    finally:
+        camera.close()
     print("识别结束，共处理 %d 帧，最后结果存于 %s" % (frame, OUT_PATH))
 
 
