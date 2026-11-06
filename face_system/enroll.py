@@ -21,10 +21,12 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 
 import align
+import liveness
 import recognizer
 import face_db
 
 DB_PATH = os.path.join(HERE, "face_db.npz")
+LIVENESS_THRESHOLD = 0.7   # 暂用起始阈值，需按项目摄像头样本校准
 
 
 def enroll(name, num_frames=5):
@@ -33,6 +35,7 @@ def enroll(name, num_frames=5):
         print("ERROR: 必须提供姓名")
         return False
 
+    anti_spoof = liveness.MiniFASNet()
     rec = recognizer.Recognizer()
     db = face_db.FaceDB(path=DB_PATH)
     if os.path.exists(DB_PATH):
@@ -51,10 +54,17 @@ def enroll(name, num_frames=5):
             print("帧 %d: 未检测到人脸，跳过" % (i + 1))
             continue
         img = Image.open(io.BytesIO(data)).convert("RGB")
+        live_scores = anti_spoof.predict(img, f[0])
+        live_score = float(live_scores[liveness.MiniFASNet.REAL_CLASS])
+        if live_score < LIVENESS_THRESHOLD:
+            print("帧 %d: 活体未通过，真人分数 %.4f，本帧不录入" %
+                  (i + 1, live_score))
+            continue
         aligned = align.warp_to_112(img, f[1])          # 5 点对齐 -> 112x112
         emb = rec.extract(aligned)
         embs.append(emb)
-        print("帧 %d: 对齐提取完成，模长 %.4f" % (i + 1, float(np.linalg.norm(emb))))
+        print("帧 %d: 活体通过 %.4f，对齐提取完成，模长 %.4f" %
+              (i + 1, live_score, float(np.linalg.norm(emb))))
 
     if not embs:
         print("ERROR: 没有成功采集到任何人脸，未注册。")
@@ -71,6 +81,7 @@ def enroll(name, num_frames=5):
 
 def enroll_from_jpeg(data, name, num_frames=1):
     """无相机的离线录入（用于测试）：直接对给定 JPEG 字节注册。"""
+    anti_spoof = liveness.MiniFASNet()
     rec = recognizer.Recognizer()
     db = face_db.FaceDB(path=DB_PATH)
     if os.path.exists(DB_PATH):
@@ -81,11 +92,17 @@ def enroll_from_jpeg(data, name, num_frames=1):
         print("ERROR: 该图未检测到人脸")
         return False
     img = Image.open(io.BytesIO(data)).convert("RGB")
+    live_scores = anti_spoof.predict(img, f[0])
+    live_score = float(live_scores[liveness.MiniFASNet.REAL_CLASS])
+    if live_score < LIVENESS_THRESHOLD:
+        print("ERROR: 活体未通过，真人分数 %.4f，未注册" % live_score)
+        return False
     aligned = align.warp_to_112(img, f[1])
     emb = rec.extract(aligned)
     db.enroll(name, emb)
     db.save(DB_PATH)
-    print("已注册 [%s]（离线），当前库共 %d 人" % (name, len(db)))
+    print("已注册 [%s]（离线，活体分数 %.4f），当前库共 %d 人" %
+          (name, live_score, len(db)))
     return True
 
 

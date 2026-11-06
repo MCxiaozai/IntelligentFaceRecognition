@@ -27,12 +27,14 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 
 import align
+import liveness
 import recognizer
 import face_db
 
 DB_PATH = os.path.join(HERE, "face_db.npz")
 OUT_PATH = os.path.join(HERE, "recognize_out.jpg")
 RECOGNIZE_THRESH = 0.4     # 识别阈值：调高降低误识，调低提升召回
+LIVENESS_THRESHOLD = 0.7   # 暂用起始阈值，需用真实照片与翻拍样本校准
 
 
 class CameraStream:
@@ -119,7 +121,7 @@ class CameraStream:
 
 def _draw_box(draw, box, label):
     x1, y1, x2, y2 = box[0], box[1], box[2], box[3]
-    color = (0, 255, 0) if label.lower() != "unknown" else (255, 0, 0)
+    color = (255, 0, 0) if label.lower().startswith(("unknown", "spoof")) else (0, 255, 0)
     draw.rectangle([x1, y1, x2, y2], outline=color, width=2)
     try:
         font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", 16)
@@ -129,6 +131,7 @@ def _draw_box(draw, box, label):
 
 
 def main(duration=0.0):
+    anti_spoof = liveness.MiniFASNet()
     rec = recognizer.Recognizer()
     db = face_db.FaceDB(path=DB_PATH)
     if os.path.exists(DB_PATH):
@@ -153,12 +156,22 @@ def main(duration=0.0):
             if not dets:
                 print("[帧 %d] 未检测到人脸" % frame)
             for box, lm in dets:
+                live_scores = anti_spoof.predict(img, box)
+                live_score = float(live_scores[liveness.MiniFASNet.REAL_CLASS])
+                if live_score < LIVENESS_THRESHOLD:
+                    label = "SPOOF %.2f" % live_score
+                    _draw_box(draw, box, label)
+                    print("[帧 %d] 活体未通过，拦截身份识别，真人分数 %.4f" %
+                          (frame, live_score))
+                    continue
+
                 aligned = align.warp_to_112(img, lm)           # 5 点对齐
                 emb = rec.extract(aligned)
                 name, score = db.recognize(emb, threshold=RECOGNIZE_THRESH)
                 label = "%s %.2f" % (name, score)
                 _draw_box(draw, box, label)
-                print("[帧 %d] 识别: %s  分数 %.4f" % (frame, name, score))
+                print("[帧 %d] 活体通过 %.4f，识别: %s，分数 %.4f" %
+                      (frame, live_score, name, score))
 
             img.save(OUT_PATH)
             frame += 1
